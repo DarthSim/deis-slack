@@ -3,32 +3,43 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/sha256"
+	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
-	"time"
 )
 
-type httpHandler struct{}
+var (
+	debug    bool
+	bind     string
+	hmacKey  []byte
+	botName  string
+	emoji    string
+	pretext  string
+	hookURLs map[string]string
+)
 
-func validateURL(url, key, msgMAC string) error {
+func validateURL(url, msgMAC string) error {
 	decMsgMac, err := hex.DecodeString(msgMAC)
 	if err != nil {
 		return errors.New("Invalid signature")
 	}
 
-	mac := hmac.New(sha256.New, []byte(key))
+	mac := hmac.New(sha1.New, hmacKey)
 	mac.Write([]byte(url))
 	expectedMAC := mac.Sum(nil)
 
-	log.Println(url)
-	log.Println(hex.EncodeToString(expectedMAC))
+	if debug {
+		log.Printf("Requested URL: %s\n", url)
+		log.Printf("Provided HMAC: %s\n", msgMAC)
+		log.Printf("Expected HMAC: %s\n", hex.EncodeToString(expectedMAC))
+	}
 
 	if !hmac.Equal(decMsgMac, expectedMAC) {
 		return errors.New("Invalid signature")
@@ -37,28 +48,23 @@ func validateURL(url, key, msgMAC string) error {
 	return nil
 }
 
-func postToSlack(channel, user, app, release string) {
-	pretext := os.Getenv("PRETEXT")
+func postToSlack(user, app, release string) {
+	url, ok := hookURLs[app]
+	if !ok {
+		log.Printf("Error: Unknown application %s", app)
+		return
+	}
+
 	text := strings.TrimSpace(fmt.Sprintf("%s @%s deployed *%s* %s", pretext, user, app, release))
-
-	botName := os.Getenv("BOT_NAME")
-	if len(botName) == 0 {
-		botName = "Deis Deployer"
-	}
-
-	emoji := os.Getenv("EMOJI")
-	if len(emoji) == 0 {
-		emoji = "nerd_face"
-	}
 
 	buf := bytes.NewBuffer([]byte{})
 	fmt.Fprintf(
 		buf,
-		"{\"attachments\": [{\"text\": \"%s\", \"color\": \"good\", \"mrkdwn_in\": [\"text\"]}], \"channel\": \"#%s\", \"username\": \"%s\", \"icon_emoji\": \":%s:\"}",
-		text, channel, botName, emoji,
+		"{\"attachments\": [{\"text\": \"%s\", \"color\": \"good\", \"mrkdwn_in\": [\"text\"]}], \"username\": \"%s\", \"icon_emoji\": \":%s:\"}",
+		text, botName, emoji,
 	)
 
-	resp, err := http.Post(os.Getenv("SLACK_URL"), "application/json", buf)
+	resp, err := http.Post(url, "application/json", buf)
 	if err != nil {
 		log.Printf("Slack Error: %s\n", err)
 	}
@@ -70,18 +76,11 @@ func postToSlack(channel, user, app, release string) {
 		}
 	}
 
-	log.Printf("%s: %s", channel, text)
+	log.Printf("Posted to Slack: %s\n", text)
 }
 
-func (h httpHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+func requestHandler(rw http.ResponseWriter, r *http.Request) {
 	log.Printf("POST: %s\n", r.URL.String())
-
-	hmacKey := os.Getenv("KEY")
-	if len(hmacKey) == 0 {
-		log.Println("Error: HMAC key should be defined")
-		rw.WriteHeader(403)
-		return
-	}
 
 	url := *r.URL
 	url.Host = r.Host
@@ -90,34 +89,88 @@ func (h httpHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		url.Scheme = "http"
 	}
 
-	if err := validateURL(url.String(), hmacKey, r.Header.Get("Authorization")); err != nil {
+	if err := validateURL(url.String(), r.Header.Get("Authorization")); err != nil {
 		log.Printf("Error: %s\n", err)
 		rw.WriteHeader(403)
 		return
 	}
 
-	channel := strings.TrimPrefix(r.URL.Path, "/")
 	app := r.URL.Query().Get("app")
 	release := r.URL.Query().Get("release")
 	user := r.URL.Query().Get("user")
 
-	go postToSlack(channel, user, app, release)
+	go postToSlack(user, app, release)
 
 	rw.WriteHeader(200)
 }
 
-func main() {
-	bind := os.Getenv("BIND")
+func parseHookUrls(s string) (urls map[string]string) {
+	urls = make(map[string]string)
 
-	s := &http.Server{
-		Addr:           bind,
-		Handler:        httpHandler{},
-		ReadTimeout:    time.Second * 5,
-		WriteTimeout:   time.Second * 10,
-		MaxHeaderBytes: 1 << 20,
+	if len(s) == 0 {
+		return
 	}
 
-	log.Printf("Starting server at %s\n", bind)
+	lines := strings.Split(s, ",")
+	for _, l := range lines {
+		parts := strings.Split(l, "=")
+		if len(parts) != 2 || len(parts[0]) == 0 || len(parts[1]) == 0 {
+			continue
+		}
 
-	log.Fatal(s.ListenAndServe())
+		ha := strings.TrimSpace(parts[0])
+		hu := strings.TrimSpace(parts[1])
+
+		if _, err := url.Parse(hu); err != nil {
+			if debug {
+				log.Printf("Skipping %s; Invalid url", hu)
+			}
+			continue
+		}
+		urls[ha] = hu
+	}
+
+	return
+}
+
+func init() {
+	debug = len(os.Getenv("DEBUG")) > 0
+
+	bind = os.Getenv("BIND")
+
+	hmacKey = []byte(os.Getenv("KEY"))
+	if len(hmacKey) == 0 {
+		log.Println("WARNING! HMAC key is emty")
+	}
+
+	botName = os.Getenv("BOT_NAME")
+	if len(botName) == 0 {
+		botName = "Deis Deployer"
+	}
+
+	emoji = os.Getenv("EMOJI")
+	if len(emoji) == 0 {
+		emoji = "nerd_face"
+	}
+
+	pretext = os.Getenv("PRETEXT")
+
+	hookURLs = parseHookUrls(os.Getenv("HOOK_URLS"))
+
+	if debug {
+		log.Printf("Bot name:   %s\n", botName)
+		log.Printf("Emoji icon: :%s:\n", emoji)
+		log.Printf("Pretext:    %s\n", pretext)
+
+		log.Println("Hook URLs:")
+		for k, v := range hookURLs {
+			log.Printf(" -> %s: %s\n", k, v)
+		}
+	}
+}
+
+func main() {
+	http.HandleFunc("/", requestHandler)
+	log.Printf("Starting server at %s\n", bind)
+	log.Fatal(http.ListenAndServe(bind, nil))
 }
